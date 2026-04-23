@@ -1,0 +1,39 @@
+{
+  "name": "@byterent/joyid-relay",
+  "version": "0.1.0",
+  "description": "Cloudflare Worker + Durable Object that brokers the JoyID phone→PC auth handshake. Deploy your own; point the frontend at it.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "example",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260101.0",
+    "typescript": "^5.6.0"
+  },
+  "keywords": [
+    "cloudflare-worker",
+    "durable-object",
+    "joyid",
+    "ckb",
+    "auth",
+    "relay"
+  ],
+  "license": "MIT",
+  "sideEffects": false
+}

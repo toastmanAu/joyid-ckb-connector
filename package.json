@@ -1,0 +1,14 @@
+{
+  "name": "joyid-ckb-connector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mobile-first JoyID connector for CKB dApps: redirect-relay flow that bypasses Chrome's flaky WebAuthn hybrid transport",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "license": "MIT"
+}

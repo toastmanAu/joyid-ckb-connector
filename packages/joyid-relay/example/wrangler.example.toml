@@ -1,0 +1,28 @@
+# Example wrangler.toml for a joyid-relay deployment.
+#
+# Copy this into your own Worker project as wrangler.toml, replace the
+# placeholder values, run:
+#   npx wrangler login
+#   npx wrangler deploy
+#
+# That's it — the Durable Object class binding handles per-session state.
+# No KV namespace to create.
+
+name = "my-auth"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+workers_dev = true
+
+# Optional custom domain. Provisions automatically if the zone is on the
+# same Cloudflare account as the Worker.
+# [[routes]]
+# pattern = "auth.mydapp.xyz"
+# custom_domain = true
+
+[[durable_objects.bindings]]
+name = "AUTH_SESSION"
+class_name = "AuthSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AuthSession"]
