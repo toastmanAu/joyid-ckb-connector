@@ -240,6 +240,28 @@ export async function beginJoyIDSign(
     typeof calculateChallenge
   >[0];
 
+  // Defensive witness padding: `calculateChallenge` refuses to run
+  // with an empty witnesses array or non-string slots, so guarantee
+  // a serialized WitnessArgs placeholder exists at every position we
+  // plan to sign at. Belt-and-suspenders in case CCC's
+  // completeFeeBy → prepareTransaction pipeline didn't propagate our
+  // earlier padding (e.g. a change-iteration clone path). The exact
+  // value doesn't matter — calculateChallenge internally serializes
+  // witness[position] with a fresh 129-byte empty lock for hashing.
+  const emptyWitnessArgs = ccc.hexFrom(
+    ccc.WitnessArgs.from({ lock: '0x' + '00'.repeat(1000) }).toBytes(),
+  );
+  if (!Array.isArray(ckbTx.witnesses)) ckbTx.witnesses = [];
+  for (const idx of opts.witnessIndexes) {
+    while (ckbTx.witnesses.length <= idx) ckbTx.witnesses.push('0x');
+    if (
+      typeof ckbTx.witnesses[idx] !== 'string' ||
+      ckbTx.witnesses[idx] === '0x'
+    ) {
+      ckbTx.witnesses[idx] = emptyWitnessArgs;
+    }
+  }
+
   // Compute the sighash JoyID will be asked to sign. witnessIndexes MUST
   // cover every input in the user's lock group — the on-chain script
   // hashes all of them, not just witness[0]. Default `[0]` is wrong
@@ -528,6 +550,10 @@ export class JoyIDRedirectSigner extends ccc.Signer {
   async prepareTransaction(
     txLike: ccc.TransactionLike,
   ): Promise<ccc.Transaction> {
+    // eslint-disable-next-line no-console
+    console.log('[JoyIDRedirectSigner.prepareTransaction] called, tx inputs:',
+      (txLike as ccc.Transaction).inputs?.length,
+      'witnesses:', (txLike as ccc.Transaction).witnesses?.length);
     const tx = ccc.Transaction.from(txLike);
     await tx.addCellDepsOfKnownScripts(this.client, ccc.KnownScript.JoyId);
 
@@ -538,11 +564,15 @@ export class JoyIDRedirectSigner extends ccc.Signer {
     // where inputs[0] isn't our lock (mixed-lock txs).
     const lockScript = (await this.getAddressObj()).script;
     const position = await tx.findInputIndexByLock(lockScript, this.client);
+    // eslint-disable-next-line no-console
+    console.log('[JoyIDRedirectSigner.prepareTransaction] position:', position);
     if (position === undefined) return tx;
 
     const witness = tx.getWitnessArgsAt(position) ?? ccc.WitnessArgs.from({});
     witness.lock = ccc.hexFrom('00'.repeat(1000));
     tx.setWitnessArgsAt(position, witness);
+    // eslint-disable-next-line no-console
+    console.log('[JoyIDRedirectSigner.prepareTransaction] after set, witnesses:', tx.witnesses.length);
     return tx;
   }
 
@@ -590,6 +620,10 @@ export class JoyIDRedirectSigner extends ccc.Signer {
         'JoyIDRedirectSigner: no JoyID-locked inputs found — tx cannot be signed by this connection',
       );
     }
+
+    // eslint-disable-next-line no-console
+    console.log('[JoyIDRedirectSigner.signOnlyTransaction] inputs:', tx.inputs.length,
+      'witnesses:', tx.witnesses.length, 'witnessIndexes:', witnessIndexes);
 
     const signerAddress = await this.getInternalAddress();
 

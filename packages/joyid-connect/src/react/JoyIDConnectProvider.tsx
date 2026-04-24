@@ -126,15 +126,29 @@ export function JoyIDConnectProvider({
       setModal({ status: 'waiting', qrPayloadUrl: '', flow: 'sign' });
 
       const relay = createRelayClient(workerUrl);
-      const handle = await beginJoyIDSign({
-        tx: payload.tx,
-        witnessIndexes: payload.witnessIndexes,
-        signerAddress: payload.signerAddress,
-        appName,
-        appIcon,
-        network,
-        relay,
-      });
+
+      let handle: SignSessionHandle;
+      try {
+        handle = await beginJoyIDSign({
+          tx: payload.tx,
+          witnessIndexes: payload.witnessIndexes,
+          signerAddress: payload.signerAddress,
+          appName,
+          appIcon,
+          network,
+          relay,
+        });
+      } catch (err) {
+        // Setup errors (missing witnesses, challenge compute fail, relay
+        // unreachable) used to silently hang the modal on "Starting
+        // session…" — surface them as a visible error instead.
+        setModal({
+          status: 'error',
+          message: err instanceof Error ? err.message : String(err),
+          flow: 'sign',
+        });
+        throw err;
+      }
       activeSignRef.current = handle;
       setModal({ status: 'waiting', qrPayloadUrl: handle.launchUrl, flow: 'sign' });
 
