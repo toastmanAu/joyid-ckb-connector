@@ -142,6 +142,17 @@ export async function beginJoyIDConnect(
   };
 }
 
+export interface SignIntentPayload {
+  /**
+   * Prepared ccc.Transaction — witness[0] is already trimmed by the
+   * signer. The provider/UX layer should NOT re-prepare; it just
+   * needs to call beginJoyIDSign with this tx + the metadata below.
+   */
+  tx: ccc.Transaction;
+  witnessIndexes: number[];
+  signerAddress: string;
+}
+
 export interface JoyIDRedirectSignerOpts {
   appName: string;
   appIcon: string;
@@ -156,6 +167,155 @@ export interface JoyIDRedirectSignerOpts {
    * resolve with the final PersistedConnection when the phone completes.
    */
   onConnectIntent: () => Promise<PersistedConnection>;
+  /**
+   * Called when the Signer's `signOnlyTransaction()` is invoked. Consumer
+   * drives the QR UX (typically via `beginJoyIDSign`), resolves with the
+   * signed `ccc.Transaction`. Optional — omit if your dApp only needs
+   * wallet connect and never signs transactions.
+   */
+  onSignIntent?: (payload: SignIntentPayload) => Promise<ccc.Transaction>;
+}
+
+export interface BeginSignOptions {
+  tx: ccc.Transaction;
+  witnessIndexes: number[];
+  signerAddress: string;
+  appName: string;
+  appIcon: string;
+  network: JoyIDNetwork;
+  /** Optional override — defaults to testnet.joyid.dev or app.joy.id based on network. */
+  joyidAppUrl?: string;
+  relay: RelayClient;
+}
+
+export interface SignSessionHandle {
+  sessionId: string;
+  /**
+   * Short URL the PC renders as QR. Phone scans → Worker 302s to the
+   * full JoyID /sign-ckb-raw-tx URL. Unlike connect's `qrPayloadUrl`,
+   * this is always ~70 bytes regardless of tx size.
+   */
+  launchUrl: string;
+  ready: Promise<ccc.Transaction>;
+  cancel: () => void;
+}
+
+/**
+ * Kick off a sign session. The tx is POSTed to the relay Worker
+ * (base64url-encoded inside a JoyID URL), phone scans the short
+ * launchUrl, Worker redirects to JoyID, user approves, JoyID posts
+ * back to /session/:id/callback, PC polls and gets the signed tx.
+ *
+ * Caller is responsible for having completed the tx (inputs, outputs,
+ * fee) BEFORE handing it to this function — see ckb-transactions.md §1.
+ * The signer method on `JoyIDRedirectSigner` takes care of witness[0]
+ * trimming before calling this helper.
+ */
+export async function beginJoyIDSign(
+  opts: BeginSignOptions,
+): Promise<SignSessionHandle> {
+  const joyidAppUrl = opts.joyidAppUrl ?? resolveJoyIDAppUrl(opts.network);
+
+  // Mint the session id client-side so we can bake the callback URL
+  // into the JoyID payload before handing it to the relay.
+  const sessionId = globalThis.crypto.randomUUID();
+
+  // `tx.stringify()` serialises CCC's Transaction to the JSON-RPC
+  // camelCase shape JoyID's /sign-ckb-raw-tx endpoint expects.
+  // We re-parse to a plain object because buildJoyIDURL JSON-encodes
+  // the whole request into `_data_`, and double-stringifying produces
+  // an escaped string instead of an object.
+  const txJson = JSON.parse(opts.tx.stringify()) as unknown;
+
+  const joyidSignUrl = buildJoyIDURL(
+    {
+      redirectURL: opts.relay.callbackUrl(sessionId),
+      name: opts.appName,
+      logo: opts.appIcon,
+      joyidAppURL: joyidAppUrl,
+      tx: txJson,
+      signerAddress: opts.signerAddress,
+      witnessIndexes: opts.witnessIndexes,
+    } as Parameters<typeof buildJoyIDURL>[0],
+    'redirect',
+    '/sign-ckb-raw-tx',
+  );
+
+  const { launchUrl } = await opts.relay.createTxSession(joyidSignUrl, sessionId);
+
+  let cancelled = false;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+  const ready = new Promise<ccc.Transaction>((resolve, reject) => {
+    const deadline = Date.now() + POLL_TIMEOUT_MS;
+
+    const cleanup = () => {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = undefined;
+    };
+
+    pollTimer = setInterval(async () => {
+      if (cancelled) {
+        cleanup();
+        reject(new Error('Sign cancelled'));
+        return;
+      }
+      if (Date.now() > deadline) {
+        cleanup();
+        reject(new Error('Sign timed out — no response from phone'));
+        return;
+      }
+
+      try {
+        const res = await opts.relay.pollSession(sessionId);
+        if (res.expired) {
+          cleanup();
+          reject(new Error('Session expired'));
+          return;
+        }
+        if (res.data) {
+          cleanup();
+          const decoded = decodeSearch(res.data) as {
+            data?: { tx?: unknown };
+            error?: string;
+          };
+          if (decoded.error) {
+            reject(new Error(`JoyID error: ${decoded.error}`));
+            return;
+          }
+          if (!decoded.data?.tx) {
+            reject(new Error('JoyID response missing signed tx'));
+            return;
+          }
+          try {
+            const signed = ccc.Transaction.from(
+              decoded.data.tx as ccc.TransactionLike,
+            );
+            resolve(signed);
+          } catch (parseErr) {
+            reject(
+              new Error(
+                `Failed to parse signed tx: ${
+                  parseErr instanceof Error ? parseErr.message : String(parseErr)
+                }`,
+              ),
+            );
+          }
+        }
+      } catch {
+        // Transient fetch errors — keep polling until the deadline.
+      }
+    }, POLL_INTERVAL_MS);
+  });
+
+  return {
+    sessionId,
+    launchUrl,
+    ready,
+    cancel: () => {
+      cancelled = true;
+    },
+  };
 }
 
 /**
@@ -233,12 +393,56 @@ export class JoyIDRedirectSigner extends ccc.Signer {
     return [await this.getAddressObj()];
   }
 
-  // Transaction signing will arrive in v0.2 via the same Worker-relay
-  // pattern. Explicitly unsupported so callers see a clear error instead
-  // of a silent bad-tx.
-  async signOnlyTransaction(): Promise<ccc.Transaction> {
-    throw new Error(
-      '@byterent/joyid-connect: transaction signing via redirect-relay is not yet implemented (v0.2 work).',
-    );
+  // Transaction signing via the same relay pattern as connect, now
+  // routing through /tx-session + /tx-launch so the QR is short
+  // regardless of tx size.
+  //
+  // Contract with the caller (see ckb-transactions.md §1): the tx must
+  // already have inputs collected, outputs finalised, and fee completed
+  // BEFORE calling this. We pad witness[0] down to an empty WitnessArgs
+  // envelope before sending to JoyID (shrinks URL, JoyID-side signing
+  // expands back). `cellOutput` / `outputData` on inputs are stripped
+  // for the same reason.
+  async signOnlyTransaction(
+    txLike: ccc.TransactionLike,
+  ): Promise<ccc.Transaction> {
+    if (!this.opts.onSignIntent) {
+      throw new Error(
+        '@byterent/joyid-connect: no onSignIntent registered. ' +
+          'Mount <JoyIDConnectProvider> with sign support, or pass onSignIntent directly.',
+      );
+    }
+
+    const tx = ccc.Transaction.from(txLike);
+    const { script } = await this.getAddressObj();
+
+    // Positions of inputs owned by the user's JoyID lock — JoyID
+    // needs these to know which witnesses it's populating.
+    const witnessIndexes: number[] = [];
+    for (let i = 0; i < tx.inputs.length; i++) {
+      const input = tx.inputs[i];
+      const { cellOutput } = await input.getCell(this.client);
+      if (cellOutput.lock.eq(script)) {
+        witnessIndexes.push(i);
+      }
+    }
+
+    // Trim witness[0] to an empty lock. Matches the official CCC
+    // JoyID signer — JoyID's server expands back to a real signature.
+    await tx.prepareSighashAllWitness(script, 0, this.client);
+
+    // Shrink the URL payload by stripping CCC's denormalisation hints.
+    tx.inputs.forEach((i) => {
+      i.cellOutput = undefined;
+      i.outputData = undefined;
+    });
+
+    const signerAddress = await this.getInternalAddress();
+
+    return this.opts.onSignIntent({
+      tx,
+      witnessIndexes,
+      signerAddress,
+    });
   }
 }

@@ -91,6 +91,94 @@ export function makeRelayWorker(opts: RelayWorkerOptions): ExportedHandler<Relay
     return json({ id: sessionId, ttl: SESSION_TTL_SECONDS }, origin);
   };
 
+  // Atomic create+arm for sign flows. Returns a short `launchUrl` the PC
+  // shows as QR — scanning it lands on /tx-launch/:id which 302s to the
+  // stored JoyID `/sign-ckb-raw-tx` URL. Avoids pushing multi-KB tx
+  // payloads through a QR directly.
+  //
+  // The client MUST supply the session id. This is a deliberate choice:
+  // a JoyID sign URL embeds its own `redirectURL = callback(id)` into
+  // the `_data_` payload, so the client needs to know the id BEFORE
+  // POSTing the URL here. Forcing a server-generated id would require
+  // a two-round create→arm handshake. Client-generated random UUIDs
+  // are fine — the DO keyed by `idFromName` gives us strong consistency,
+  // and an attacker guessing a session id still can't produce a valid
+  // JoyID response without Face ID on an enrolled device.
+  const handleTxSession = async (
+    env: RelayEnv,
+    origin: string | null,
+    request: Request,
+    url: URL,
+  ): Promise<Response> => {
+    let body: { id?: string; joyidSignUrl?: string };
+    try {
+      body = (await request.json()) as { id?: string; joyidSignUrl?: string };
+    } catch {
+      return json({ error: 'invalid json body' }, origin, 400);
+    }
+    if (!body.id || typeof body.id !== 'string') {
+      return json({ error: 'id required' }, origin, 400);
+    }
+    if (!body.joyidSignUrl || typeof body.joyidSignUrl !== 'string') {
+      return json({ error: 'joyidSignUrl required' }, origin, 400);
+    }
+
+    const sessionId = body.id;
+    const stub = stubFor(env, sessionId);
+
+    const createRes = await stub.fetch('https://do/create', { method: 'POST' });
+    if (!createRes.ok) {
+      return json({ error: 'failed to create session' }, origin, 500);
+    }
+    const armRes = await stub.fetch('https://do/arm', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ joyidSignUrl: body.joyidSignUrl }),
+    });
+    if (!armRes.ok) {
+      return json({ error: 'failed to arm session' }, origin, 500);
+    }
+
+    // Worker's origin serves as the base for the launchUrl — callers hit
+    // the Worker at whatever domain routes to it (.workers.dev or a
+    // custom domain), so we reflect that back.
+    const launchUrl = `${url.origin}/tx-launch/${sessionId}`;
+    return json({ id: sessionId, launchUrl, ttl: SESSION_TTL_SECONDS }, origin);
+  };
+
+  // Phone lands here via QR scan. Fetch the armed JoyID URL and 302.
+  // No CORS — this is a top-level navigation, not a fetch.
+  const handleTxLaunch = async (env: RelayEnv, id: string): Promise<Response> => {
+    const stub = stubFor(env, id);
+    const res = await stub.fetch('https://do/launch');
+    if (res.status === 410) {
+      return htmlPage(
+        'Session expired',
+        'This signing request has already expired. Start a new one on your computer.',
+        false,
+        logoDataUrl,
+      );
+    }
+    if (res.status === 409) {
+      return htmlPage(
+        'Already used',
+        'This signing request has already been completed. Return to your computer.',
+        false,
+        logoDataUrl,
+      );
+    }
+    if (!res.ok) {
+      return htmlPage(
+        'Error',
+        'Could not load the signing request. Try again from your computer.',
+        false,
+        logoDataUrl,
+      );
+    }
+    const { joyidSignUrl } = (await res.json()) as { joyidSignUrl: string };
+    return Response.redirect(joyidSignUrl, 302);
+  };
+
   const handlePoll = async (env: RelayEnv, id: string, origin: string | null): Promise<Response> => {
     const stub = stubFor(env, id);
     const res = await stub.fetch('https://do/poll');
@@ -178,8 +266,17 @@ export function makeRelayWorker(opts: RelayWorkerOptions): ExportedHandler<Relay
         return handleCreate(env, origin);
       }
 
+      if (url.pathname === '/tx-session' && request.method === 'POST') {
+        return handleTxSession(env, origin, request, url);
+      }
+
       if (url.pathname === '/logo.png' && request.method === 'GET') {
         return handleLogo();
+      }
+
+      const txLaunch = url.pathname.match(/^\/tx-launch\/([^/]+)$/);
+      if (txLaunch && request.method === 'GET') {
+        return handleTxLaunch(env, txLaunch[1]);
       }
 
       const match = url.pathname.match(/^\/session\/([^/]+)(\/callback)?$/);

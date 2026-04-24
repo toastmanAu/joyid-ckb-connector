@@ -10,7 +10,7 @@
 import { ccc } from '@ckb-ccc/ccc';
 import type { WalletWithSigners, SignersControllerRefreshContext } from '@ckb-ccc/ccc';
 import { JoyIDRedirectSigner } from './signer';
-import { requestJoyIDConnect } from './orchestrator';
+import { requestJoyIDConnect, requestJoyIDSign } from './orchestrator';
 import { JOY_ID_ICON } from './joyidIcon';
 import type { JoyIDNetwork } from './config';
 
@@ -51,6 +51,7 @@ export class JoyIDRedirectSignersController extends ccc.SignersController {
         const handle = await requestJoyIDConnect();
         return handle.ready;
       },
+      onSignIntent: async (payload) => requestJoyIDSign(payload),
     });
 
     await this.addSigners(

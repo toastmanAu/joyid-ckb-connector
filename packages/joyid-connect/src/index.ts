@@ -1,6 +1,7 @@
-// Framework-agnostic entry point. The CCC Signer, session helper, and
+// Framework-agnostic entry point. The CCC Signer, session helpers, and
 // relay client live here — any framework (React, Vue, Svelte, plain JS)
-// can build a UI on top of beginJoyIDConnect() + JoyIDRedirectSigner.
+// can build a UI on top of beginJoyIDConnect() / beginJoyIDSign() +
+// JoyIDRedirectSigner.
 //
 // The React-specific pieces (Provider, modal, QR) live at
 // "@byterent/joyid-connect/react".
@@ -8,16 +9,21 @@
 export {
   JoyIDRedirectSigner,
   beginJoyIDConnect,
+  beginJoyIDSign,
   type JoyIDRedirectSignerOpts,
   type BeginConnectOptions,
+  type BeginSignOptions,
   type PersistedConnection,
   type SessionHandle,
+  type SignSessionHandle,
+  type SignIntentPayload,
 } from './signer';
 
 export {
   createRelayClient,
   type RelayClient,
   type CreateSessionResponse,
+  type CreateTxSessionResponse,
   type PollResponse,
 } from './worker';
 
@@ -33,4 +39,6 @@ export {
 export {
   registerJoyIDRequester,
   requestJoyIDConnect,
+  registerJoyIDSignRequester,
+  requestJoyIDSign,
 } from './orchestrator';

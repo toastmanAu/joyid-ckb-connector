@@ -2,13 +2,25 @@
 // wherever you mount <ccc.Provider> so that (a) the CCC wallet picker
 // can be closed when our flow begins, and (b) our QR modal renders on
 // top of it.
+//
+// The provider handles two flows — connect (ready: PersistedConnection)
+// and sign (ready: ccc.Transaction) — with the same modal chrome. Only
+// the title + status copy changes.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { beginJoyIDConnect } from '../signer';
-import type { SessionHandle } from '../signer';
+import type { ccc } from '@ckb-ccc/core';
+import { beginJoyIDConnect, beginJoyIDSign } from '../signer';
+import type {
+  SessionHandle,
+  SignSessionHandle,
+  SignIntentPayload,
+} from '../signer';
 import { createRelayClient } from '../worker';
-import { registerJoyIDRequester } from '../orchestrator';
+import {
+  registerJoyIDRequester,
+  registerJoyIDSignRequester,
+} from '../orchestrator';
 import { JoyIDConnectModal } from './ConnectModal';
 import type { JoyIDConnectModalProps } from './ConnectModal';
 import type { JoyIDNetwork } from '../config';
@@ -32,15 +44,28 @@ export interface JoyIDConnectProviderProps {
    */
   onBeginConnect?: () => void;
 
+  /**
+   * Called when this provider begins a sign flow. Typical use: close any
+   * outer UI so the QR modal is the focused interaction.
+   */
+  onBeginSign?: () => void;
+
   /** Forwarded to the QR modal — styling + branding hooks. */
-  modalProps?: Partial<Omit<JoyIDConnectModalProps, 'qrPayloadUrl' | 'status' | 'errorMessage' | 'onCancel'>>;
+  modalProps?: Partial<Omit<JoyIDConnectModalProps, 'qrPayloadUrl' | 'status' | 'errorMessage' | 'onCancel' | 'title'>>;
+
+  /** Title override for the connect modal. Default: "Connect JoyID". */
+  connectTitle?: string;
+
+  /** Title override for the sign modal. Default: "Sign transaction". */
+  signTitle?: string;
 }
 
+type FlowKind = 'connect' | 'sign';
 type ModalState =
   | { status: 'idle' }
-  | { status: 'waiting'; qrPayloadUrl: string }
-  | { status: 'done' }
-  | { status: 'error'; message: string };
+  | { status: 'waiting'; qrPayloadUrl: string; flow: FlowKind }
+  | { status: 'done'; flow: FlowKind }
+  | { status: 'error'; message: string; flow: FlowKind };
 
 export function JoyIDConnectProvider({
   children,
@@ -49,16 +74,21 @@ export function JoyIDConnectProvider({
   network,
   workerUrl,
   onBeginConnect,
+  onBeginSign,
   modalProps,
+  connectTitle = 'Connect JoyID',
+  signTitle = 'Sign transaction',
 }: JoyIDConnectProviderProps) {
   const [modal, setModal] = useState<ModalState>({ status: 'idle' });
-  const activeHandleRef = useRef<SessionHandle | null>(null);
+  const activeConnectRef = useRef<SessionHandle | null>(null);
+  const activeSignRef = useRef<SignSessionHandle | null>(null);
 
-  const request = useCallback(async (): Promise<SessionHandle> => {
-    activeHandleRef.current?.cancel();
+  const requestConnect = useCallback(async (): Promise<SessionHandle> => {
+    activeConnectRef.current?.cancel();
+    activeSignRef.current?.cancel();
 
     onBeginConnect?.();
-    setModal({ status: 'waiting', qrPayloadUrl: '' });
+    setModal({ status: 'waiting', qrPayloadUrl: '', flow: 'connect' });
 
     const relay = createRelayClient(workerUrl);
     const handle = await beginJoyIDConnect({
@@ -67,18 +97,19 @@ export function JoyIDConnectProvider({
       network,
       relay,
     });
-    activeHandleRef.current = handle;
-    setModal({ status: 'waiting', qrPayloadUrl: handle.qrPayloadUrl });
+    activeConnectRef.current = handle;
+    setModal({ status: 'waiting', qrPayloadUrl: handle.qrPayloadUrl, flow: 'connect' });
 
     handle.ready.then(
       () => {
-        setModal({ status: 'done' });
+        setModal({ status: 'done', flow: 'connect' });
         setTimeout(() => setModal({ status: 'idle' }), 600);
       },
       (err: unknown) => {
         setModal({
           status: 'error',
           message: err instanceof Error ? err.message : String(err),
+          flow: 'connect',
         });
       },
     );
@@ -86,13 +117,57 @@ export function JoyIDConnectProvider({
     return handle;
   }, [appName, appIcon, network, workerUrl, onBeginConnect]);
 
-  useEffect(() => registerJoyIDRequester(request), [request]);
+  const requestSign = useCallback(
+    async (payload: SignIntentPayload): Promise<ccc.Transaction> => {
+      activeConnectRef.current?.cancel();
+      activeSignRef.current?.cancel();
+
+      onBeginSign?.();
+      setModal({ status: 'waiting', qrPayloadUrl: '', flow: 'sign' });
+
+      const relay = createRelayClient(workerUrl);
+      const handle = await beginJoyIDSign({
+        tx: payload.tx,
+        witnessIndexes: payload.witnessIndexes,
+        signerAddress: payload.signerAddress,
+        appName,
+        appIcon,
+        network,
+        relay,
+      });
+      activeSignRef.current = handle;
+      setModal({ status: 'waiting', qrPayloadUrl: handle.launchUrl, flow: 'sign' });
+
+      try {
+        const signed = await handle.ready;
+        setModal({ status: 'done', flow: 'sign' });
+        setTimeout(() => setModal({ status: 'idle' }), 600);
+        return signed;
+      } catch (err) {
+        setModal({
+          status: 'error',
+          message: err instanceof Error ? err.message : String(err),
+          flow: 'sign',
+        });
+        throw err;
+      }
+    },
+    [appName, appIcon, network, workerUrl, onBeginSign],
+  );
+
+  useEffect(() => registerJoyIDRequester(requestConnect), [requestConnect]);
+  useEffect(() => registerJoyIDSignRequester(requestSign), [requestSign]);
 
   const cancel = () => {
-    activeHandleRef.current?.cancel();
-    activeHandleRef.current = null;
+    activeConnectRef.current?.cancel();
+    activeConnectRef.current = null;
+    activeSignRef.current?.cancel();
+    activeSignRef.current = null;
     setModal({ status: 'idle' });
   };
+
+  const currentTitle =
+    modal.status !== 'idle' && modal.flow === 'sign' ? signTitle : connectTitle;
 
   return (
     <>
@@ -110,6 +185,7 @@ export function JoyIDConnectProvider({
                 : 'idle'
         }
         errorMessage={modal.status === 'error' ? modal.message : undefined}
+        title={currentTitle}
         onCancel={cancel}
       />
     </>
