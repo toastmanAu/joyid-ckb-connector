@@ -1,13 +1,30 @@
 // Thin client for a joyid-relay Worker. The Worker URL is injected — the
 // library has no default, no hardcoded domain, no ByteRent-specific assumption.
 
+/**
+ * Structured preview shown on the Worker's phone-side confirmation
+ * page. Kept in the worker module so both the relay client and the
+ * library consumers can share the shape.
+ */
+export interface TxPreviewPayload {
+  title: string;
+  amount?: string;
+  details: Array<{ label: string; value: string; mono?: boolean }>;
+  network?: 'testnet' | 'mainnet';
+}
+
 export interface RelayClient {
   createSession(): Promise<CreateSessionResponse>;
   /**
    * Create a signing session. Caller mints the id (so it can bake the
-   * redirectURL into the JoyID URL before POSTing).
+   * redirectURL into the JoyID URL before POSTing) and optionally
+   * supplies a preview payload to show on the phone confirmation page.
    */
-  createTxSession(joyidSignUrl: string, id: string): Promise<CreateTxSessionResponse>;
+  createTxSession(
+    joyidSignUrl: string,
+    id: string,
+    preview?: TxPreviewPayload,
+  ): Promise<CreateTxSessionResponse>;
   pollSession(id: string): Promise<PollResponse>;
   callbackUrl(sessionId: string): string;
 }
@@ -45,11 +62,15 @@ export function createRelayClient(workerUrl: string): RelayClient {
       return res.json() as Promise<CreateSessionResponse>;
     },
 
-    async createTxSession(joyidSignUrl: string, id: string): Promise<CreateTxSessionResponse> {
+    async createTxSession(
+      joyidSignUrl: string,
+      id: string,
+      preview?: TxPreviewPayload,
+    ): Promise<CreateTxSessionResponse> {
       const res = await fetch(`${base}/tx-session`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id, joyidSignUrl }),
+        body: JSON.stringify({ id, joyidSignUrl, preview }),
       });
       if (!res.ok) {
         throw new Error(`joyid-relay tx-session create failed: ${res.status} ${res.statusText}`);

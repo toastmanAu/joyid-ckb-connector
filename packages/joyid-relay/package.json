@@ -1,6 +1,6 @@
 {
   "name": "@byterent/joyid-relay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cloudflare Worker + Durable Object that brokers the JoyID phone→PC auth handshake. Deploy your own; point the frontend at it.",
   "type": "module",
   "main": "./dist/index.js",

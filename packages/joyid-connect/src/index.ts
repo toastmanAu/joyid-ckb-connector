@@ -17,6 +17,7 @@ export {
   type SessionHandle,
   type SignSessionHandle,
   type SignIntentPayload,
+  type TxPreview,
 } from './signer';
 
 export {
@@ -25,6 +26,7 @@ export {
   type CreateSessionResponse,
   type CreateTxSessionResponse,
   type PollResponse,
+  type TxPreviewPayload,
 } from './worker';
 
 export { resolveJoyIDAppUrl, type JoyIDNetwork } from './config';

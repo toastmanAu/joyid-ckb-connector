@@ -148,6 +148,37 @@ export async function beginJoyIDConnect(
   };
 }
 
+/**
+ * Human-readable summary of a transaction, rendered on the phone-side
+ * preview page before the user confirms and hands off to JoyID.
+ *
+ * JoyID's sign-message flow shows only a raw hex hash during Face ID
+ * — which is cryptographically correct but opaque to users. This
+ * preview is displayed on the relay Worker's domain (trusted as part
+ * of the dApp) so users can review "send X CKB to Y" in plain English
+ * before the hash approval step.
+ */
+export interface TxPreview {
+  /**
+   * Short line at the top of the preview — what kind of operation
+   * this is. Shown above the hero amount. E.g. "Send CKB",
+   * "Create listing", "Cancel lease".
+   */
+  title: string;
+  /**
+   * Optional hero amount — the headline number the user is
+   * authorising. E.g. "63 CKB", "100 CKB + lease rights".
+   */
+  amount?: string;
+  /**
+   * Key/value rows shown below the hero. Use `mono: true` for
+   * fixed-width content like addresses or tx hashes.
+   */
+  details: Array<{ label: string; value: string; mono?: boolean }>;
+  /** 'testnet' or 'mainnet' — renders a subtle badge. Defaults to omit. */
+  network?: 'testnet' | 'mainnet';
+}
+
 export interface SignIntentPayload {
   /**
    * Prepared ccc.Transaction — witness[0] is already trimmed by the
@@ -157,6 +188,12 @@ export interface SignIntentPayload {
   tx: ccc.Transaction;
   witnessIndexes: number[];
   signerAddress: string;
+  /**
+   * Optional human-readable preview. If omitted, the phone preview
+   * page falls back to a generic "Sign transaction" body with a
+   * truncated tx-hash as the only detail.
+   */
+  preview?: TxPreview;
 }
 
 export interface JoyIDRedirectSignerOpts {
@@ -192,6 +229,13 @@ export interface BeginSignOptions {
   /** Optional override — defaults to testnet.joyid.dev or app.joy.id based on network. */
   joyidAppUrl?: string;
   relay: RelayClient;
+  /**
+   * Optional structured preview shown on the Worker-hosted phone
+   * confirmation page before JoyID's Face ID prompt. Strongly
+   * recommended — JoyID's sign-message UI only shows a hex hash,
+   * so without a preview the user is blind-signing.
+   */
+  preview?: TxPreview;
 }
 
 export interface SignSessionHandle {
@@ -281,7 +325,7 @@ export async function beginJoyIDSign(
     'redirect',
   );
 
-  const { launchUrl } = await opts.relay.createTxSession(joyidSignUrl, sessionId);
+  const { launchUrl } = await opts.relay.createTxSession(joyidSignUrl, sessionId, opts.preview);
 
   let cancelled = false;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -470,6 +514,15 @@ export class JoyIDRedirectSigner extends ccc.Signer {
   private connection?: PersistedConnection;
   private readonly opts: JoyIDRedirectSignerOpts;
   private readonly storageKey: string;
+  /**
+   * Caller sets this immediately before invoking `signTransaction` /
+   * `signOnlyTransaction` to customise the phone-side preview. It is
+   * consumed once and then cleared, so every sign operation needs a
+   * fresh call. This is a scoped side-channel — CCC's `Signer` base
+   * interface has no parameter for passing UX metadata through to
+   * signers, so we expose it as an explicit staging field.
+   */
+  pendingPreview?: TxPreview;
 
   constructor(client: ccc.Client, opts: JoyIDRedirectSignerOpts) {
     super(client);
@@ -550,29 +603,16 @@ export class JoyIDRedirectSigner extends ccc.Signer {
   async prepareTransaction(
     txLike: ccc.TransactionLike,
   ): Promise<ccc.Transaction> {
-    // eslint-disable-next-line no-console
-    console.log('[JoyIDRedirectSigner.prepareTransaction] called, tx inputs:',
-      (txLike as ccc.Transaction).inputs?.length,
-      'witnesses:', (txLike as ccc.Transaction).witnesses?.length);
     const tx = ccc.Transaction.from(txLike);
     await tx.addCellDepsOfKnownScripts(this.client, ccc.KnownScript.JoyId);
 
-    // Reserve witness[0] space sized for JoyID's signed lock
-    // (~161 bytes but match the official signer's 1000-byte reservation
-    // for fee safety — see ckb-transactions.md §1). CCC's
-    // `findInputIndexByLock` + `getWitnessArgsAt` handle the case
-    // where inputs[0] isn't our lock (mixed-lock txs).
     const lockScript = (await this.getAddressObj()).script;
     const position = await tx.findInputIndexByLock(lockScript, this.client);
-    // eslint-disable-next-line no-console
-    console.log('[JoyIDRedirectSigner.prepareTransaction] position:', position);
     if (position === undefined) return tx;
 
     const witness = tx.getWitnessArgsAt(position) ?? ccc.WitnessArgs.from({});
     witness.lock = ccc.hexFrom('00'.repeat(1000));
     tx.setWitnessArgsAt(position, witness);
-    // eslint-disable-next-line no-console
-    console.log('[JoyIDRedirectSigner.prepareTransaction] after set, witnesses:', tx.witnesses.length);
     return tx;
   }
 
@@ -621,16 +661,19 @@ export class JoyIDRedirectSigner extends ccc.Signer {
       );
     }
 
-    // eslint-disable-next-line no-console
-    console.log('[JoyIDRedirectSigner.signOnlyTransaction] inputs:', tx.inputs.length,
-      'witnesses:', tx.witnesses.length, 'witnessIndexes:', witnessIndexes);
-
     const signerAddress = await this.getInternalAddress();
+
+    // Consume the caller's staged preview (if any) and clear so a
+    // subsequent sign without an explicit preview falls back to the
+    // generic body rather than silently inheriting the old one.
+    const preview = this.pendingPreview;
+    this.pendingPreview = undefined;
 
     return this.opts.onSignIntent({
       tx,
       witnessIndexes,
       signerAddress,
+      preview,
     });
   }
 }

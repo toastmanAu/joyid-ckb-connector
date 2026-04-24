@@ -137,6 +137,7 @@ export function JoyIDConnectProvider({
           appIcon,
           network,
           relay,
+          preview: payload.preview,
         });
       } catch (err) {
         // Setup errors (missing witnesses, challenge compute fail, relay

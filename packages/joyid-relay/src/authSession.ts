@@ -35,6 +35,8 @@ export class AuthSession {
         return this.arm(request);
       case '/launch':
         return this.launch();
+      case '/cancel':
+        return this.cancel();
       case '/callback':
         return this.callback(url.searchParams.get('_data_') ?? '');
       case '/poll':
@@ -66,18 +68,25 @@ export class AuthSession {
     if (existing !== undefined) {
       return jsonResponse({ ok: false, reason: 'already_armed' }, 409);
     }
-    const { joyidSignUrl } = (await request.json()) as { joyidSignUrl?: string };
+    const { joyidSignUrl, preview } = (await request.json()) as {
+      joyidSignUrl?: string;
+      preview?: unknown;
+    };
     if (!joyidSignUrl || typeof joyidSignUrl !== 'string') {
       return jsonResponse({ ok: false, reason: 'missing_url' }, 400);
     }
     await this.state.storage.put('armedUrl', joyidSignUrl);
+    if (preview !== undefined) {
+      await this.state.storage.put('preview', JSON.stringify(preview));
+    }
     return new Response(null, { status: 204 });
   }
 
   // Phone hits /tx-launch/:id → Worker calls this → returns the armed
-  // JoyID URL so the Worker can 302 the phone. Repeatable: a phone that
-  // loses its redirect mid-flow can re-scan the QR and try again, as
-  // long as /callback hasn't fired yet.
+  // JoyID URL + optional preview payload so the Worker can render the
+  // confirmation page (or 302 directly if no preview was staged).
+  // Repeatable: a phone that loses its redirect mid-flow can re-scan
+  // the QR and try again, as long as /callback hasn't fired yet.
   private async launch(): Promise<Response> {
     const current = await this.state.storage.get<SessionState>('state');
     if (current === undefined) {
@@ -90,7 +99,20 @@ export class AuthSession {
     if (armedUrl === undefined) {
       return jsonResponse({ ok: false, reason: 'not_armed' }, 409);
     }
-    return jsonResponse({ joyidSignUrl: armedUrl });
+    const previewRaw = await this.state.storage.get<string>('preview');
+    return jsonResponse({
+      joyidSignUrl: armedUrl,
+      preview: previewRaw ? (JSON.parse(previewRaw) as unknown) : null,
+    });
+  }
+
+  // Phone-side user tapped Cancel. Clear the DO immediately so:
+  //  - re-scanning the QR returns 410 (expired-looking)
+  //  - the PC's poll loop eventually sees 410 and rejects gracefully
+  //    instead of waiting the full 120s timeout.
+  private async cancel(): Promise<Response> {
+    await this.state.storage.deleteAll();
+    return new Response(null, { status: 204 });
   }
 
   private async callback(data: string): Promise<Response> {
@@ -106,8 +128,9 @@ export class AuthSession {
     }
     await this.state.storage.put('state', 'ready' as SessionState);
     await this.state.storage.put('data', data);
-    // `armedUrl` can be cleared now — the phone is past it.
+    // `armedUrl` + preview can be cleared now — the phone is past it.
     await this.state.storage.delete('armedUrl');
+    await this.state.storage.delete('preview');
     return new Response(null, { status: 204 });
   }
 
