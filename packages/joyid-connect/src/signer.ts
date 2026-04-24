@@ -518,9 +518,25 @@ export interface SameDeviceConnectOptions {
   joyidAppUrl?: string;
   /** localStorage key the signer uses — must match the controller's. */
   storageKey?: string;
+  /**
+   * CCC persists the active wallet at localStorage key
+   * `ccc-connection-info` as `{walletName, signerName}` after a
+   * successful signer.connect(). In the same-device flow connect()
+   * never returns (page navigates away) so CCC never writes it.
+   * Pass these here and `beginSameDeviceConnect` primes the key
+   * before navigation — CCC then picks up the restored signer on
+   * the return page load.
+   *
+   * `walletName` must match the controller's `walletLabel` (default
+   * "JoyID"). `signerName` must match the entry passed to
+   * `addSigners` (our controller uses "CKB").
+   */
+  cccWalletName: string;
+  cccSignerName: string;
 }
 
 const PENDING_SUFFIX = '.mobilePending';
+const CCC_CONNECTION_KEY = 'ccc-connection-info';
 
 export function beginSameDeviceConnect(
   opts: SameDeviceConnectOptions,
@@ -531,6 +547,19 @@ export function beginSameDeviceConnect(
   // Flag the pending connect so hydrateJoyIDRedirect on return can
   // tell this redirect was ours (not some other JoyID-flavoured nav).
   window.localStorage.setItem(storageKey + PENDING_SUFFIX, '1');
+
+  // Prime CCC's active-wallet state BEFORE navigation. CCC's
+  // connector element reads this on mount and restores whichever
+  // signer was active last. Without it, our signer's persisted
+  // connection sits in localStorage but CCC thinks no wallet was
+  // picked and leaves the UI showing "Connect wallet".
+  window.localStorage.setItem(
+    CCC_CONNECTION_KEY,
+    JSON.stringify({
+      walletName: opts.cccWalletName,
+      signerName: opts.cccSignerName,
+    }),
+  );
 
   // Top-level navigation — the rest of the request finishes in a
   // new page load after JoyID redirects us back.

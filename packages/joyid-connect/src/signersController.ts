@@ -51,6 +51,12 @@ export class JoyIDRedirectSignersController extends ccc.SignersController {
       (w: WalletWithSigners) => w.name !== 'JoyID Passkey',
     );
 
+    // Pre-compute the CCC wallet/signer-name pair so same-device's
+    // pre-navigation localStorage prime uses the exact values we
+    // register with addSigners below.
+    const cccWalletName = this.opts.walletLabel ?? 'JoyID';
+    const cccSignerName = 'CKB';
+
     const signer = new JoyIDRedirectSigner(context.client, {
       appName: context.appName,
       appIcon: context.appIcon,
@@ -59,18 +65,15 @@ export class JoyIDRedirectSignersController extends ccc.SignersController {
       storageKey: this.opts.storageKey,
       onConnectIntent: this.opts.sameDevice
         ? async () => {
-            // Navigates away; never resolves. hydrateJoyIDRedirect
-            // on the next page load writes the connection into
-            // localStorage which CCC then picks up via isConnected().
             await beginSameDeviceConnect({
               appName: context.appName,
               appIcon: context.appIcon,
               network: this.opts.network,
               joyidAppUrl: this.opts.joyidAppUrl,
               storageKey: this.opts.storageKey,
+              cccWalletName,
+              cccSignerName,
             });
-            // Unreachable — but CCC needs a typed return to satisfy
-            // the signer's onConnectIntent signature.
             throw new Error('unreachable — page navigated to JoyID');
           }
         : async () => {
@@ -81,9 +84,9 @@ export class JoyIDRedirectSignersController extends ccc.SignersController {
     });
 
     await this.addSigners(
-      this.opts.walletLabel ?? 'JoyID',
+      cccWalletName,
       this.opts.walletIcon ?? JOY_ID_ICON,
-      [{ name: 'CKB', signer }],
+      [{ name: cccSignerName, signer }],
       context,
     );
   }
