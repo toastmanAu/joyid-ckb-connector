@@ -9,7 +9,11 @@
 
 import { ccc } from '@ckb-ccc/ccc';
 import type { WalletWithSigners, SignersControllerRefreshContext } from '@ckb-ccc/ccc';
-import { JoyIDRedirectSigner, beginSameDeviceConnect } from './signer';
+import {
+  JoyIDRedirectSigner,
+  beginSameDeviceConnect,
+  beginSameDeviceSign,
+} from './signer';
 import { requestJoyIDConnect, requestJoyIDSign } from './orchestrator';
 import { JOY_ID_ICON } from './joyidIcon';
 import type { JoyIDNetwork } from './config';
@@ -80,7 +84,25 @@ export class JoyIDRedirectSignersController extends ccc.SignersController {
             const handle = await requestJoyIDConnect();
             return handle.ready;
           },
-      onSignIntent: async (payload) => requestJoyIDSign(payload),
+      onSignIntent: this.opts.sameDevice
+        ? async (payload) => {
+            // Same-device sign navigates away; the caller's Promise
+            // never resolves. On the return page load, consumers
+            // call `consumeSameDeviceSignResult()` to reconstruct
+            // and submit the signed tx.
+            await beginSameDeviceSign({
+              tx: payload.tx,
+              witnessIndexes: payload.witnessIndexes,
+              signerAddress: payload.signerAddress,
+              preview: payload.preview,
+              appName: context.appName,
+              appIcon: context.appIcon,
+              network: this.opts.network,
+              joyidAppUrl: this.opts.joyidAppUrl,
+            });
+            throw new Error('unreachable — page navigated to JoyID');
+          }
+        : async (payload) => requestJoyIDSign(payload),
     });
 
     await this.addSigners(

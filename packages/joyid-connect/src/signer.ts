@@ -593,6 +593,13 @@ export function hydrateJoyIDRedirect(
   if (typeof window === 'undefined') return false;
   if (!isRedirectFromJoyID(window.location.href)) return false;
 
+  // If a sign is pending, leave the URL + query params alone so
+  // consumeSameDeviceSignResult can read them. The sign consumer
+  // handles its own cleanup.
+  if (window.localStorage.getItem(SIGN_PENDING_KEY) !== null) {
+    return false;
+  }
+
   const storageKey = opts.storageKey ?? DEFAULT_STORAGE_KEY;
   const pendingKey = storageKey + PENDING_SUFFIX;
   const pending = window.localStorage.getItem(pendingKey);
@@ -635,6 +642,182 @@ function stripJoyIDQueryParams(): void {
   url.searchParams.delete('_data_');
   url.searchParams.delete('joyid-redirect');
   window.history.replaceState({}, '', url.toString());
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  Same-device SIGN flow (mobile)
+// ────────────────────────────────────────────────────────────────────
+//
+// Mirrors beginSameDeviceConnect but for tx signing. The tricky bit:
+// the user's click-handler context has to survive a full top-level
+// navigation, which plain Promise-resolve can't carry. Solution:
+// stash the tx state (+ preview metadata) in localStorage before
+// navigating, and let the consumer explicitly reclaim it with
+// `consumeSameDeviceSignResult()` on the return page load.
+//
+// After the callback is consumed once, the stashed state is cleared.
+// Uncalled, it times out naturally via the 10-minute sanity TTL
+// applied on read.
+
+const SIGN_PENDING_KEY = 'joyid-connect.signPending';
+const SIGN_PENDING_TTL_MS = 10 * 60 * 1000;
+
+interface PendingSignEntry {
+  ckbTx: Parameters<typeof calculateChallenge>[0];
+  witnessIndexes: number[];
+  preview?: TxPreview;
+  ts: number;
+}
+
+export interface SameDeviceSignOptions {
+  tx: ccc.Transaction;
+  witnessIndexes: number[];
+  signerAddress: string;
+  appName: string;
+  appIcon: string;
+  network: JoyIDNetwork;
+  joyidAppUrl?: string;
+  preview?: TxPreview;
+}
+
+export async function beginSameDeviceSign(
+  opts: SameDeviceSignOptions,
+): Promise<never> {
+  const joyidAppURL = opts.joyidAppUrl ?? resolveJoyIDAppUrl(opts.network);
+
+  // Serialise the CCC Transaction to the JSON-RPC shape both
+  // calculateChallenge AND buildSignedTx (on return) expect.
+  const ckbTx = JSON.parse(opts.tx.stringify()) as Parameters<
+    typeof calculateChallenge
+  >[0];
+
+  // Defensive witness padding — see beginJoyIDSign for the full
+  // reasoning. calculateChallenge re-serialises witness[position]
+  // with an empty 129-byte lock internally, so the placeholder
+  // value doesn't affect the sighash; we only need a well-formed
+  // WitnessArgs at every position we intend to sign at.
+  const emptyWitnessArgs = ccc.hexFrom(
+    ccc.WitnessArgs.from({ lock: '0x' + '00'.repeat(1000) }).toBytes(),
+  );
+  if (!Array.isArray(ckbTx.witnesses)) ckbTx.witnesses = [];
+  for (const idx of opts.witnessIndexes) {
+    while (ckbTx.witnesses.length <= idx) ckbTx.witnesses.push('0x');
+    if (
+      typeof ckbTx.witnesses[idx] !== 'string' ||
+      ckbTx.witnesses[idx] === '0x'
+    ) {
+      ckbTx.witnesses[idx] = emptyWitnessArgs;
+    }
+  }
+
+  // Compute the challenge BEFORE navigating; JoyID needs it in the
+  // URL payload, and we want to surface any compute errors here
+  // (where the caller can catch them) rather than on the return page.
+  const challenge = await calculateChallenge(ckbTx, opts.witnessIndexes);
+
+  // Stash everything the return-side needs to reconstruct the tx.
+  const pending: PendingSignEntry = {
+    ckbTx,
+    witnessIndexes: opts.witnessIndexes,
+    preview: opts.preview,
+    ts: Date.now(),
+  };
+  window.localStorage.setItem(SIGN_PENDING_KEY, JSON.stringify(pending));
+
+  const joyidSignUrl = buildJoyIDSignMessageURL(
+    {
+      redirectURL: window.location.href,
+      name: opts.appName,
+      logo: opts.appIcon,
+      joyidAppURL,
+      challenge,
+      isData: false,
+      address: opts.signerAddress,
+    } as Parameters<typeof buildJoyIDSignMessageURL>[0],
+    'redirect',
+  );
+
+  window.location.assign(joyidSignUrl);
+  return new Promise<never>(() => {});
+}
+
+export interface SameDeviceSignResult {
+  signedTx: ccc.Transaction;
+  preview?: TxPreview;
+}
+
+/**
+ * Called on the return page load. If a sign was pending and the URL
+ * carries a valid JoyID callback payload, reconstructs the signed
+ * `ccc.Transaction` and returns it along with the original preview.
+ * Returns null otherwise.
+ *
+ * Clears both the pending state AND the JoyID query params on
+ * success. Safe to call unconditionally from useEffect / route
+ * mounts — no-op on normal loads.
+ */
+export function consumeSameDeviceSignResult(): SameDeviceSignResult | null {
+  if (typeof window === 'undefined') return null;
+  if (!isRedirectFromJoyID(window.location.href)) return null;
+
+  const raw = window.localStorage.getItem(SIGN_PENDING_KEY);
+  if (!raw) return null;
+
+  let pending: PendingSignEntry;
+  try {
+    pending = JSON.parse(raw) as PendingSignEntry;
+  } catch {
+    window.localStorage.removeItem(SIGN_PENDING_KEY);
+    return null;
+  }
+
+  if (Date.now() - pending.ts > SIGN_PENDING_TTL_MS) {
+    // Stale — user started a sign, then disappeared for hours. Clear
+    // it out rather than signing something the user forgot about.
+    window.localStorage.removeItem(SIGN_PENDING_KEY);
+    stripJoyIDQueryParams();
+    return null;
+  }
+
+  try {
+    const data = authCallback() as {
+      signature?: string;
+      message?: string;
+      pubkey?: string;
+      keyType?: string;
+      alg?: number;
+    };
+    if (!data.signature || !data.pubkey || !data.message) return null;
+
+    const signedCkbTx = assembleSignedTx(
+      pending.ckbTx,
+      {
+        signature: data.signature,
+        message: data.message,
+        pubkey: data.pubkey,
+        keyType: data.keyType,
+        alg: data.alg,
+      },
+      pending.witnessIndexes,
+    );
+    const signedTx = ccc.Transaction.from(signedCkbTx as ccc.TransactionLike);
+    return { signedTx, preview: pending.preview };
+  } catch {
+    return null;
+  } finally {
+    window.localStorage.removeItem(SIGN_PENDING_KEY);
+    stripJoyIDQueryParams();
+  }
+}
+
+/**
+ * Tell `hydrateJoyIDRedirect` whether a same-device sign is
+ * currently pending. Used from main.tsx to decide "skip auth
+ * hydration and leave the URL for consumeSameDeviceSignResult".
+ */
+export function hasPendingSameDeviceSign(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(SIGN_PENDING_KEY) !== null;
 }
 
 function hexToUint8Array(hex: string): Uint8Array {
