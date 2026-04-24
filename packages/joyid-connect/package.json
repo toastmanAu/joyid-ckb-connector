@@ -1,6 +1,6 @@
 {
   "name": "@byterent/joyid-connect",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "CCC Signer + React provider + QR modal for the JoyID redirect-relay flow",
   "type": "module",
   "main": "./dist/index.js",

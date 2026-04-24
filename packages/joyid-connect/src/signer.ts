@@ -513,6 +513,39 @@ export class JoyIDRedirectSigner extends ccc.Signer {
     return [await this.getAddressObj()];
   }
 
+  /**
+   * CCC's `completeFeeBy` calls this before estimating fees; by
+   * convention it's also the point where a signer attaches any
+   * cell_deps its lock script needs and reserves witness space for
+   * the eventual signature. Matches what the official CCC JoyID
+   * signer does (see @ckb-ccc/joy-id/dist/ckb/index.js) — without
+   * this, the tx reaches the pool but fails script execution with
+   * `ScriptNotFound` because the JoyID lock code isn't in cell_deps.
+   *
+   * Subkey (COTA) wallets aren't supported by this redirect signer
+   * yet — we deferred that path day-1 since it needs an aggregator.
+   */
+  async prepareTransaction(
+    txLike: ccc.TransactionLike,
+  ): Promise<ccc.Transaction> {
+    const tx = ccc.Transaction.from(txLike);
+    await tx.addCellDepsOfKnownScripts(this.client, ccc.KnownScript.JoyId);
+
+    // Reserve witness[0] space sized for JoyID's signed lock
+    // (~161 bytes but match the official signer's 1000-byte reservation
+    // for fee safety — see ckb-transactions.md §1). CCC's
+    // `findInputIndexByLock` + `getWitnessArgsAt` handle the case
+    // where inputs[0] isn't our lock (mixed-lock txs).
+    const lockScript = (await this.getAddressObj()).script;
+    const position = await tx.findInputIndexByLock(lockScript, this.client);
+    if (position === undefined) return tx;
+
+    const witness = tx.getWitnessArgsAt(position) ?? ccc.WitnessArgs.from({});
+    witness.lock = ccc.hexFrom('00'.repeat(1000));
+    tx.setWitnessArgsAt(position, witness);
+    return tx;
+  }
+
   // Transaction signing via the redirect-relay pattern. Because JoyID's
   // /sign-ckb-raw-tx endpoint breaks redirect mode (see beginJoyIDSign
   // comment), we use /sign-message instead: compute the sighash
