@@ -1,6 +1,6 @@
 {
   "name": "@byterent/joyid-connect",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CCC Signer + React provider + QR modal for the JoyID redirect-relay flow",
   "type": "module",
   "main": "./dist/index.js",
@@ -28,6 +28,7 @@
   },
   "peerDependencies": {
     "@ckb-ccc/ccc": "^1.0.0",
+    "@joyid/ckb": "^1.1.0",
     "@joyid/common": "^0.2.0",
     "qr-code-styling": "^1.9.0",
     "react": "^18.0.0 || ^19.0.0"
@@ -38,6 +39,7 @@
   },
   "devDependencies": {
     "@ckb-ccc/ccc": "^1.0.0",
+    "@joyid/ckb": "^1.1.0",
     "@joyid/common": "^0.2.0",
     "@types/react": "^19.0.0",
     "qr-code-styling": "^1.9.0",

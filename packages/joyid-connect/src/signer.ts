@@ -18,7 +18,13 @@
 // use the same redirect-relay pattern against /sign-ckb-raw-tx in v0.2.
 
 import { ccc } from '@ckb-ccc/core';
-import { decodeSearch, buildJoyIDURL } from '@joyid/common';
+import {
+  decodeSearch,
+  buildJoyIDURL,
+  buildJoyIDSignMessageURL,
+  base64urlToHex,
+} from '@joyid/common';
+import { calculateChallenge, buildSignedTx } from '@joyid/ckb';
 import type { RelayClient } from './worker';
 import { resolveJoyIDAppUrl, type JoyIDNetwork } from './config';
 
@@ -201,15 +207,22 @@ export interface SignSessionHandle {
 }
 
 /**
- * Kick off a sign session. The tx is POSTed to the relay Worker
- * (base64url-encoded inside a JoyID URL), phone scans the short
- * launchUrl, Worker redirects to JoyID, user approves, JoyID posts
- * back to /session/:id/callback, PC polls and gets the signed tx.
+ * Kick off a sign session.
+ *
+ * JoyID's `/sign-ckb-raw-tx` endpoint hard-codes popup communication —
+ * `type=redirect` is ignored, the page errors at load with "window closed"
+ * because it can't find `window.opener`. Only `/auth` and `/sign-message`
+ * actually support redirect.
+ *
+ * So we pivot: compute the CKB sighash challenge client-side (same hash
+ * the on-chain JoyID lock script validates), ask JoyID to sign *that*
+ * via `/sign-message?type=redirect`, then assemble the final witness
+ * ourselves using `@joyid/ckb`'s `buildSignedTx`.
  *
  * Caller is responsible for having completed the tx (inputs, outputs,
- * fee) BEFORE handing it to this function — see ckb-transactions.md §1.
- * The signer method on `JoyIDRedirectSigner` takes care of witness[0]
- * trimming before calling this helper.
+ * fee, witness[0] placeholder) BEFORE handing it to this function —
+ * see ckb-transactions.md §1. We don't mutate the tx's witness sizes;
+ * calculateChallenge handles the 129-byte empty-lock internally.
  */
 export async function beginJoyIDSign(
   opts: BeginSignOptions,
@@ -221,24 +234,29 @@ export async function beginJoyIDSign(
   const sessionId = globalThis.crypto.randomUUID();
 
   // `tx.stringify()` serialises CCC's Transaction to the JSON-RPC
-  // camelCase shape JoyID's /sign-ckb-raw-tx endpoint expects.
-  // We re-parse to a plain object because buildJoyIDURL JSON-encodes
-  // the whole request into `_data_`, and double-stringifying produces
-  // an escaped string instead of an object.
-  const txJson = JSON.parse(opts.tx.stringify()) as unknown;
+  // camelCase shape `@joyid/ckb` expects. Re-parse to a plain object
+  // so calculateChallenge can read it + buildSignedTx can mutate it.
+  const ckbTx = JSON.parse(opts.tx.stringify()) as Parameters<
+    typeof calculateChallenge
+  >[0];
 
-  const joyidSignUrl = buildJoyIDURL(
+  // Compute the sighash JoyID will be asked to sign. witnessIndexes MUST
+  // cover every input in the user's lock group — the on-chain script
+  // hashes all of them, not just witness[0]. Default `[0]` is wrong
+  // for multi-input txs.
+  const challenge = await calculateChallenge(ckbTx, opts.witnessIndexes);
+
+  const joyidSignUrl = buildJoyIDSignMessageURL(
     {
       redirectURL: opts.relay.callbackUrl(sessionId),
       name: opts.appName,
       logo: opts.appIcon,
       joyidAppURL: joyidAppUrl,
-      tx: txJson,
-      signerAddress: opts.signerAddress,
-      witnessIndexes: opts.witnessIndexes,
-    } as Parameters<typeof buildJoyIDURL>[0],
+      challenge,
+      isData: false,
+      address: opts.signerAddress,
+    } as Parameters<typeof buildJoyIDSignMessageURL>[0],
     'redirect',
-    '/sign-ckb-raw-tx',
   );
 
   const { launchUrl } = await opts.relay.createTxSession(joyidSignUrl, sessionId);
@@ -276,27 +294,42 @@ export async function beginJoyIDSign(
         if (res.data) {
           cleanup();
           const decoded = decodeSearch(res.data) as {
-            data?: { tx?: unknown };
+            data?: {
+              signature?: string;
+              message?: string;
+              pubkey?: string;
+              keyType?: string;
+              alg?: number;
+            };
             error?: string;
           };
           if (decoded.error) {
             reject(new Error(`JoyID error: ${decoded.error}`));
             return;
           }
-          if (!decoded.data?.tx) {
-            reject(new Error('JoyID response missing signed tx'));
+          const payload = decoded.data;
+          if (!payload?.signature || !payload.pubkey || !payload.message) {
+            reject(new Error('JoyID response missing signature/pubkey/message'));
             return;
           }
           try {
-            const signed = ccc.Transaction.from(
-              decoded.data.tx as ccc.TransactionLike,
+            const signedTx = assembleSignedTx(
+              ckbTx,
+              {
+                signature: payload.signature,
+                message: payload.message,
+                pubkey: payload.pubkey,
+                keyType: payload.keyType,
+                alg: payload.alg,
+              },
+              opts.witnessIndexes,
             );
-            resolve(signed);
-          } catch (parseErr) {
+            resolve(ccc.Transaction.from(signedTx as ccc.TransactionLike));
+          } catch (asmErr) {
             reject(
               new Error(
-                `Failed to parse signed tx: ${
-                  parseErr instanceof Error ? parseErr.message : String(parseErr)
+                `Failed to assemble signed tx: ${
+                  asmErr instanceof Error ? asmErr.message : String(asmErr)
                 }`,
               ),
             );
@@ -316,6 +349,93 @@ export async function beginJoyIDSign(
       cancelled = true;
     },
   };
+}
+
+/**
+ * Normalise the redirect-flow sign-message response and assemble the
+ * final signed witness via @joyid/ckb's buildSignedTx.
+ *
+ * Redirect-mode responses differ from popup responses in two annoying
+ * ways that have to be unwound before buildSignedTx accepts them:
+ *   - `signature` and `message` arrive as base64url, not hex.
+ *   - `signature` is DER-encoded ECDSA (from the raw WebAuthn
+ *     credential), but the on-chain lock expects IEEE P1363 (r‖s,
+ *     fixed 64 bytes). Popup flow does this conversion on JoyID's
+ *     servers before returning — redirect flow skips it.
+ *
+ * Reference: ~/fiberquest/src/agent-wallet.js :: assembleSignedTx —
+ * proven against mainnet + testnet since the FiberQuest tournament
+ * launch. Ported here to keep the library self-contained.
+ */
+function assembleSignedTx(
+  unsignedCkbTx: Parameters<typeof buildSignedTx>[0],
+  payload: {
+    signature: string;
+    message: string;
+    pubkey: string;
+    keyType?: string;
+    alg?: number;
+  },
+  witnessIndexes: number[],
+): ReturnType<typeof buildSignedTx> {
+  const isHex = (s: string): boolean => /^(0x)?[0-9a-f]*$/i.test(s);
+
+  let signature = isHex(payload.signature)
+    ? payload.signature
+    : base64urlToHex(payload.signature);
+  let message = isHex(payload.message)
+    ? payload.message
+    : base64urlToHex(payload.message);
+  let pubkey = payload.pubkey;
+
+  if (pubkey.startsWith('0x')) pubkey = pubkey.slice(2);
+  if (signature.startsWith('0x')) signature = signature.slice(2);
+  if (message.startsWith('0x')) message = message.slice(2);
+
+  // DER → IEEE P1363. IEEE is exactly 128 hex chars (64 bytes: r‖s).
+  // DER layout: 30 LEN 02 rLen r 02 sLen s — length varies by leading
+  // sign bits. Trim or zero-pad r and s to 32 bytes each.
+  if (signature.length !== 128) {
+    const derBytes = hexToUint8Array(signature);
+    const rLen = derBytes[3];
+    const rStart = 4;
+    const rEnd = rStart + rLen;
+    const sLen = derBytes[rEnd + 1];
+    const sStart = rEnd + 2;
+    const sEnd = sStart + sLen;
+    let r = uint8ArrayToHex(derBytes.subarray(rStart, rEnd));
+    let s = uint8ArrayToHex(derBytes.subarray(sStart, sEnd));
+    r = r.length > 64 ? r.slice(-64) : r.padStart(64, '0');
+    s = s.length > 64 ? s.slice(-64) : s.padStart(64, '0');
+    signature = r + s;
+  }
+
+  const normalized = {
+    signature,
+    message,
+    pubkey,
+    keyType: payload.keyType ?? 'main_key',
+    alg: payload.alg,
+  } as Parameters<typeof buildSignedTx>[1];
+
+  return buildSignedTx(unsignedCkbTx, normalized, witnessIndexes);
+}
+
+function hexToUint8Array(hex: string): Uint8Array {
+  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+function uint8ArrayToHex(bytes: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) {
+    s += bytes[i].toString(16).padStart(2, '0');
+  }
+  return s;
 }
 
 /**
@@ -393,16 +513,18 @@ export class JoyIDRedirectSigner extends ccc.Signer {
     return [await this.getAddressObj()];
   }
 
-  // Transaction signing via the same relay pattern as connect, now
-  // routing through /tx-session + /tx-launch so the QR is short
-  // regardless of tx size.
+  // Transaction signing via the redirect-relay pattern. Because JoyID's
+  // /sign-ckb-raw-tx endpoint breaks redirect mode (see beginJoyIDSign
+  // comment), we use /sign-message instead: compute the sighash
+  // client-side via `calculateChallenge`, JoyID signs the hash, we
+  // assemble the witness ourselves via `buildSignedTx`.
   //
-  // Contract with the caller (see ckb-transactions.md §1): the tx must
+  // Contract with the caller (ckb-transactions.md §1): the tx must
   // already have inputs collected, outputs finalised, and fee completed
-  // BEFORE calling this. We pad witness[0] down to an empty WitnessArgs
-  // envelope before sending to JoyID (shrinks URL, JoyID-side signing
-  // expands back). `cellOutput` / `outputData` on inputs are stripped
-  // for the same reason.
+  // BEFORE calling this. We preserve the caller's witness[0]
+  // placeholder (typically ~1000-byte lock) — calculateChallenge
+  // rewrites it to a 129-byte empty-lock internally for the hash, so
+  // our stored size doesn't affect sighash.
   async signOnlyTransaction(
     txLike: ccc.TransactionLike,
   ): Promise<ccc.Transaction> {
@@ -416,8 +538,11 @@ export class JoyIDRedirectSigner extends ccc.Signer {
     const tx = ccc.Transaction.from(txLike);
     const { script } = await this.getAddressObj();
 
-    // Positions of inputs owned by the user's JoyID lock — JoyID
-    // needs these to know which witnesses it's populating.
+    // Positions of inputs owned by the user's JoyID lock. The on-chain
+    // JoyID lock script hashes EVERY witness in its group when
+    // validating, so we need them all — not just [0]. FiberQuest
+    // uses `inputs.map((_, i) => i)` which works when all inputs share
+    // one lock; we compute per-input to handle mixed-lock txs safely.
     const witnessIndexes: number[] = [];
     for (let i = 0; i < tx.inputs.length; i++) {
       const input = tx.inputs[i];
@@ -427,15 +552,11 @@ export class JoyIDRedirectSigner extends ccc.Signer {
       }
     }
 
-    // Trim witness[0] to an empty lock. Matches the official CCC
-    // JoyID signer — JoyID's server expands back to a real signature.
-    await tx.prepareSighashAllWitness(script, 0, this.client);
-
-    // Shrink the URL payload by stripping CCC's denormalisation hints.
-    tx.inputs.forEach((i) => {
-      i.cellOutput = undefined;
-      i.outputData = undefined;
-    });
+    if (witnessIndexes.length === 0) {
+      throw new Error(
+        'JoyIDRedirectSigner: no JoyID-locked inputs found — tx cannot be signed by this connection',
+      );
+    }
 
     const signerAddress = await this.getInternalAddress();
 
