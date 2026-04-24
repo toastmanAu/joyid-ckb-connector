@@ -9,7 +9,7 @@
 
 import { ccc } from '@ckb-ccc/ccc';
 import type { WalletWithSigners, SignersControllerRefreshContext } from '@ckb-ccc/ccc';
-import { JoyIDRedirectSigner } from './signer';
+import { JoyIDRedirectSigner, beginSameDeviceConnect } from './signer';
 import { requestJoyIDConnect, requestJoyIDSign } from './orchestrator';
 import { JOY_ID_ICON } from './joyidIcon';
 import type { JoyIDNetwork } from './config';
@@ -24,6 +24,16 @@ export interface JoyIDRedirectSignersControllerOptions {
   walletIcon?: string;
   /** localStorage key used to persist the connection. */
   storageKey?: string;
+  /**
+   * When true, the connect flow uses JoyID's same-device
+   * `authWithRedirect` (top-level nav away + redirect back) instead
+   * of the cross-device relay (QR + phone scan). Set this on mobile,
+   * where the passkey lives on the same device.
+   *
+   * Note: sign-flow on same-device mode is NOT yet implemented —
+   * calling `signOnlyTransaction` will fail until that ships.
+   */
+  sameDevice?: boolean;
 }
 
 export class JoyIDRedirectSignersController extends ccc.SignersController {
@@ -47,10 +57,26 @@ export class JoyIDRedirectSignersController extends ccc.SignersController {
       network: this.opts.network,
       joyidAppUrl: this.opts.joyidAppUrl,
       storageKey: this.opts.storageKey,
-      onConnectIntent: async () => {
-        const handle = await requestJoyIDConnect();
-        return handle.ready;
-      },
+      onConnectIntent: this.opts.sameDevice
+        ? async () => {
+            // Navigates away; never resolves. hydrateJoyIDRedirect
+            // on the next page load writes the connection into
+            // localStorage which CCC then picks up via isConnected().
+            await beginSameDeviceConnect({
+              appName: context.appName,
+              appIcon: context.appIcon,
+              network: this.opts.network,
+              joyidAppUrl: this.opts.joyidAppUrl,
+              storageKey: this.opts.storageKey,
+            });
+            // Unreachable — but CCC needs a typed return to satisfy
+            // the signer's onConnectIntent signature.
+            throw new Error('unreachable — page navigated to JoyID');
+          }
+        : async () => {
+            const handle = await requestJoyIDConnect();
+            return handle.ready;
+          },
       onSignIntent: async (payload) => requestJoyIDSign(payload),
     });
 

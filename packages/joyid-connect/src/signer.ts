@@ -23,6 +23,9 @@ import {
   buildJoyIDURL,
   buildJoyIDSignMessageURL,
   base64urlToHex,
+  authWithRedirect,
+  authCallback,
+  isRedirectFromJoyID,
 } from '@joyid/common';
 import { calculateChallenge, buildSignedTx } from '@joyid/ckb';
 import type { RelayClient } from './worker';
@@ -485,6 +488,124 @@ function assembleSignedTx(
   } as Parameters<typeof buildSignedTx>[1];
 
   return buildSignedTx(unsignedCkbTx, normalized, witnessIndexes);
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  Same-device flow (mobile)
+// ────────────────────────────────────────────────────────────────────
+//
+// Desktop needs the relay because the passkey lives on a different
+// device. On a phone, the passkey is RIGHT HERE — no handoff. The
+// simplest flow is just JoyID's `authWithRedirect`: top-level nav
+// away to testnet.joyid.dev, Face ID, redirect back to us with the
+// auth payload in the URL.
+//
+// Two halves:
+//   - `beginSameDeviceConnect(opts)` kicks the navigation. Never
+//     returns (page unloads). Call it from an `onConnectIntent`.
+//   - `hydrateJoyIDRedirect(opts)` runs once at app-init. Detects
+//     a JoyID return-redirect, decodes the payload, persists it to
+//     localStorage under the same `storageKey` JoyIDRedirectSigner
+//     uses, then strips the query params. After this, CCC's
+//     `signer.isConnected()` lookup succeeds from localStorage as
+//     if the user had connected normally.
+
+export interface SameDeviceConnectOptions {
+  appName: string;
+  appIcon: string;
+  network: JoyIDNetwork;
+  /** Optional override — defaults to testnet.joyid.dev or app.joy.id. */
+  joyidAppUrl?: string;
+  /** localStorage key the signer uses — must match the controller's. */
+  storageKey?: string;
+}
+
+const PENDING_SUFFIX = '.mobilePending';
+
+export function beginSameDeviceConnect(
+  opts: SameDeviceConnectOptions,
+): Promise<never> {
+  const storageKey = opts.storageKey ?? DEFAULT_STORAGE_KEY;
+  const joyidAppURL = opts.joyidAppUrl ?? resolveJoyIDAppUrl(opts.network);
+
+  // Flag the pending connect so hydrateJoyIDRedirect on return can
+  // tell this redirect was ours (not some other JoyID-flavoured nav).
+  window.localStorage.setItem(storageKey + PENDING_SUFFIX, '1');
+
+  // Top-level navigation — the rest of the request finishes in a
+  // new page load after JoyID redirects us back.
+  authWithRedirect({
+    redirectURL: window.location.href,
+    name: opts.appName,
+    logo: opts.appIcon,
+    joyidAppURL,
+  } as Parameters<typeof authWithRedirect>[0]);
+
+  // Never resolves — the page is about to unload.
+  return new Promise<never>(() => {});
+}
+
+export interface HydrateJoyIDRedirectOptions {
+  /** Same key used by JoyIDRedirectSigner so CCC can find the connection. */
+  storageKey?: string;
+}
+
+/**
+ * Run once at app init (before CCC mounts). Detects a JoyID
+ * return-redirect in the current URL, consumes it, and persists
+ * the connection. No-op if we didn't initiate a pending connect.
+ *
+ * Returns true if a connection was hydrated (useful for logging /
+ * telemetry). Safe to call unconditionally on every page load.
+ */
+export function hydrateJoyIDRedirect(
+  opts: HydrateJoyIDRedirectOptions = {},
+): boolean {
+  if (typeof window === 'undefined') return false;
+  if (!isRedirectFromJoyID(window.location.href)) return false;
+
+  const storageKey = opts.storageKey ?? DEFAULT_STORAGE_KEY;
+  const pendingKey = storageKey + PENDING_SUFFIX;
+  const pending = window.localStorage.getItem(pendingKey);
+
+  // Someone else (or a stale URL) put joyid-redirect in the bar.
+  // Don't touch localStorage, but still strip the query so it's
+  // gone by the time the rest of the app mounts.
+  if (!pending) {
+    stripJoyIDQueryParams();
+    return false;
+  }
+
+  try {
+    const data = authCallback() as {
+      address?: string;
+      pubkey?: string;
+      keyType?: string;
+    };
+    if (data.address && data.pubkey) {
+      const persisted: PersistedConnection = {
+        address: data.address,
+        publicKey: data.pubkey,
+        keyType: data.keyType ?? 'main_key',
+      };
+      window.localStorage.setItem(storageKey, JSON.stringify(persisted));
+      return true;
+    }
+    return false;
+  } catch {
+    // Malformed or signed-in-elsewhere — clear state and move on.
+    return false;
+  } finally {
+    window.localStorage.removeItem(pendingKey);
+    stripJoyIDQueryParams();
+  }
+}
+
+function stripJoyIDQueryParams(): void {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('_data_');
+  url.searchParams.delete('joyid-redirect');
+  window.history.replaceState({}, '', url.toString());
 }
 
 function hexToUint8Array(hex: string): Uint8Array {
